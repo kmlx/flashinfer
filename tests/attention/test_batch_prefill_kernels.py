@@ -2788,6 +2788,109 @@ def test_paged_prefill_split_kv_empty_chunk(dtype):
 
 
 @pytest.mark.parametrize("kv_cache", ["paged", "ragged"])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
+def test_batch_prefill_split_kv_rounds_output_once(kv_cache, head_dim):
+    """A split-KV plan rounds each output to bf16 once, after the merge, as the unsplit
+    plan does: the partial outputs and the merge state stay in fp32.
+
+    With q = 0 every logit is 0 and every softmax weight is exactly 1, so both plans sum
+    the same bf16 values in fp32 and differ only by fp32 rounding, which flips well under
+    1% of the bf16 outputs. Partials rounded to bf16 before the merge flip about half."""
+    skip_if_head_dim_unsupported(head_dim)
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    batch_size, qo_len, kv_len, page_size = 4, 4, 4096, 16
+    num_qo_heads, num_kv_heads = 16, 4
+    # 16 chunks per request, so each lane of the merge kernel merges several chunks.
+    split_tokens = 256
+
+    q = torch.zeros(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda:0"
+    )
+    k = torch.randn(batch_size, kv_len, num_kv_heads, head_dim, device="cuda:0").to(
+        dtype
+    )
+    v = (
+        torch.randn(batch_size, kv_len, num_kv_heads, head_dim, device="cuda:0") * 0.5
+    ).to(dtype)
+    qo_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * qo_len
+    )
+
+    if kv_cache == "paged":
+        pages_per_request = kv_len // page_size
+        kv_indptr = (
+            torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0")
+            * pages_per_request
+        )
+        kv_indices = torch.arange(
+            batch_size * pages_per_request, dtype=torch.int32, device="cuda:0"
+        )
+        last_page_len = torch.full(
+            (batch_size,), page_size, dtype=torch.int32, device="cuda:0"
+        )
+        # [num_pages, 2, page_size, num_kv_heads, head_dim], pages of a request in order.
+        kv_data = (
+            torch.stack([k, v], dim=1)
+            .reshape(
+                batch_size, 2, pages_per_request, page_size, num_kv_heads, head_dim
+            )
+            .transpose(1, 2)
+            .reshape(-1, 2, page_size, num_kv_heads, head_dim)
+        )
+        plan_args = (
+            kv_indptr,
+            kv_indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+        )
+        run_args = (kv_data,)
+        split_size = split_tokens // page_size  # fixed_split_size counts pages here
+        cls = flashinfer.BatchPrefillWithPagedKVCacheWrapper
+    else:
+        kv_indptr = (
+            torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * kv_len
+        )
+        plan_args = (kv_indptr, num_qo_heads, num_kv_heads, head_dim)
+        run_args = (
+            k.reshape(-1, num_kv_heads, head_dim),
+            v.reshape(-1, num_kv_heads, head_dim),
+        )
+        split_size = split_tokens
+        cls = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
+
+    def run(**split_kwargs):
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+        wrapper = cls(workspace, "NHD", backend="fa2")
+        wrapper.plan(
+            qo_indptr,
+            *plan_args,
+            causal=False,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            **split_kwargs,
+        )
+        # split_kv is the last field of PrefillPlanInfo::ToVector (scheduler.cuh).
+        return wrapper.run(q, *run_args), bool(wrapper._plan_info[14])
+
+    o_split, split = run(fixed_split_size=split_size)
+    o_whole, whole_split = run(disable_split_kv=True)
+    assert split and not whole_split
+
+    group_size = num_qo_heads // num_kv_heads
+    ref = v.float().mean(dim=1).repeat_interleave(group_size, dim=1)
+    ref = ref.repeat_interleave(qo_len, dim=0)
+    torch.testing.assert_close(o_split.float(), ref, rtol=1e-2, atol=1e-3)
+    mismatches = (o_split != o_whole).sum().item()
+    assert mismatches <= o_split.numel() // 50, (
+        f"{mismatches} of {o_split.numel()} split-KV outputs differ from the unsplit plan"
+    )
+
+
+@pytest.mark.parametrize("kv_cache", ["paged", "ragged"])
 def test_batch_prefill_cuda_graph_padding_without_split_kv(kv_cache):
     """Under CUDA graphs the prefill kernels are launched over padded_batch_size
     CTAs; the plan writes request / tile indices only for the real ones, and the

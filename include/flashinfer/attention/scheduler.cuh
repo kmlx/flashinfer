@@ -869,6 +869,10 @@ inline cudaError_t PrefillPlanImpl(
     // addresses them at o_indptr[request] + qo_idx * num_kv_chunks + kv_tile_idx,
     // so the row count is sum_i qo_len_i * num_chunks_i.
     //
+    // The FA2 batch prefill kernels write tmp_v in fp32 whatever the output dtype,
+    // so that a split row is rounded to the output dtype once, as an unsplit row
+    // is. Keep sizeof(float) here.
+    //
     // cta_tile_q counts *packed* (row, head) indices, so one CTA spans
     // cta_tile_q / gqa_group_size query rows rather than cta_tile_q of them.
     // Sizing the buffers by padded_batch_size * cta_tile_q therefore

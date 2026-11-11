@@ -705,7 +705,9 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    // cp.async loads at most 32 bytes per thread, so fp32 partials of head_dim 512 take bdx = 64.
+    constexpr uint32_t vec_size =
+        std::min(std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U), 32U / sizeof(DTypeIn));
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdy = num_threads / bdx;
@@ -757,7 +759,9 @@ cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    // cp.async loads at most 32 bytes per thread, so fp32 partials of head_dim 512 take bdx = 64.
+    constexpr uint32_t vec_size =
+        std::min(std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U), 32U / sizeof(DTypeIn));
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdy = num_threads / bdx;
